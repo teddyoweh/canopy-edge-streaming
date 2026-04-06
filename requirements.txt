@@ -1,0 +1,5 @@
+opencv-python>=4.9.0
+flask>=3.0.0
+numpy>=1.26
+requests>=2.31.0
+gunicorn>=22.0.0

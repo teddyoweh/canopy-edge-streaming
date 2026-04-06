@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>CanopyStreamer</string>
+    <key>CFBundleIdentifier</key>
+    <string>io.canopyads.edge-streamer</string>
+    <key>CFBundleName</key>
+    <string>Canopy Streamer</string>
+    <key>CFBundleDisplayName</key>
+    <string>Canopy Streamer</string>
+    <key>CFBundleVersion</key>
+    <string>1.0.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleSignature</key>
+    <string>????</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>10.15</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>LSUIElement</key>
+    <false/>
+    <key>NSCameraUsageDescription</key>
+    <string>Canopy Streamer needs camera access to broadcast your live video stream to Canopy screens.</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>NSSupportsAutomaticTermination</key>
+    <false/>
+    <key>NSSupportsSuddenTermination</key>
+    <false/>
+</dict>
+</plist>

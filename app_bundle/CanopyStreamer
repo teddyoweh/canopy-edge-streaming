@@ -1,0 +1,554 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────
+#  Canopy Streamer — macOS .app Launcher
+#
+#  KEY DESIGN: The GUI window launches IMMEDIATELY using system Python,
+#  showing a setup progress screen. All backend setup (venv, deps, camera,
+#  tunnel) happens in the background. The GUI polls a progress file and
+#  transitions to the streaming view once everything is ready.
+#
+#  The user just double-clicks the .app and always sees a window instantly.
+# ─────────────────────────────────────────────────────────────────────────
+
+# NO set -euo pipefail — user-facing launcher must be resilient.
+
+# ── Fix PATH for .app launch ──────────────────────────────────────────
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
+if [ -f "/opt/homebrew/bin/brew" ]; then
+    eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null || true
+elif [ -f "/usr/local/bin/brew" ]; then
+    eval "$(/usr/local/bin/brew shellenv)" 2>/dev/null || true
+fi
+
+# ── Paths ──────────────────────────────────────────────────────────────
+
+MACOS_DIR="$(cd "$(dirname "$0")" && pwd)"
+CONTENTS_DIR="$(dirname "$MACOS_DIR")"
+RESOURCES="$CONTENTS_DIR/Resources"
+
+WORK_DIR="$HOME/Library/Application Support/CanopyStreamer"
+mkdir -p "$WORK_DIR"
+cd "$WORK_DIR"
+
+# ── Crash log ──────────────────────────────────────────────────────────
+CRASH_LOG="$WORK_DIR/crash.log"
+exec > >(tee -a "$CRASH_LOG") 2>&1
+echo ""
+echo "=== Canopy Streamer launch: $(date) ==="
+echo "PATH: $PATH"
+echo "Python: $(which python3 2>/dev/null || echo 'NOT FOUND')"
+
+# ── Copy resources to working directory ────────────────────────────────
+for f in server.py requirements.txt; do
+    if [ -f "$RESOURCES/$f" ]; then
+        if [ ! -f "$WORK_DIR/$f" ] || [ "$RESOURCES/$f" -nt "$WORK_DIR/$f" ]; then
+            cp "$RESOURCES/$f" "$WORK_DIR/$f"
+        fi
+    fi
+done
+cp "$RESOURCES/gui.py" "$WORK_DIR/gui.py" 2>/dev/null || true
+
+# ── Config ─────────────────────────────────────────────────────────────
+
+PORT="${PORT:-8554}"
+CAMERA="${CAMERA:-0}"
+SOURCE="${SOURCE:-}"
+RESOLUTION="${RESOLUTION:-640x480}"
+FPS="${FPS:-15}"
+
+CANOPY_API="${CANOPY_API:-https://canopy-api-154019513092.us-central1.run.app/api/v1}"
+SCREEN_ID="${SCREEN_ID:-}"
+API_TOKEN="${API_TOKEN:-}"
+
+LOG_DIR="$WORK_DIR/logs"
+TUNNEL_LOG="$LOG_DIR/tunnel.log"
+STREAMER_LOG="$LOG_DIR/streamer.log"
+URL_FILE="$WORK_DIR/.public_url"
+PID_FILE="$WORK_DIR/.pids"
+TUNNEL_PID_FILE="$WORK_DIR/.tunnel_pid"
+CONFIG_FILE="$WORK_DIR/.config"
+PROGRESS_FILE="$WORK_DIR/.setup_progress"
+
+export SOURCE CAMERA RESOLUTION FPS PORT
+
+mkdir -p "$LOG_DIR"
+
+# ── Helpers ────────────────────────────────────────────────────────────
+
+notify() {
+    osascript -e "display notification \"$1\" with title \"Canopy Streamer\"" 2>/dev/null || true
+}
+
+alert() {
+    osascript -e "display dialog \"$1\" with title \"Canopy Streamer\" buttons {\"OK\"} default button \"OK\" with icon caution" 2>/dev/null || true
+}
+
+progress() {
+    # Write progress step to file — GUI polls this
+    echo "STEP:$1" >> "$PROGRESS_FILE"
+    echo "  [progress] $1"
+}
+
+progress_error() {
+    echo "ERROR:$1" >> "$PROGRESS_FILE"
+    echo "  [error] $1"
+}
+
+# ── Cleanup ────────────────────────────────────────────────────────────
+
+_CLEANING_UP=0
+cleanup() {
+    if [ "$_CLEANING_UP" -eq 1 ]; then return; fi
+    _CLEANING_UP=1
+    echo "Cleanup triggered at $(date)"
+
+    # Kill GUI if running
+    if [ -n "${GUI_PID:-}" ]; then
+        kill "$GUI_PID" 2>/dev/null || true
+    fi
+
+    if [ -f "$PID_FILE" ]; then
+        while IFS= read -r pid; do
+            if [ -n "$pid" ]; then
+                kill "$pid" 2>/dev/null || true
+            fi
+        done < "$PID_FILE"
+        rm -f "$PID_FILE"
+    fi
+    pkill -P $$ 2>/dev/null || true
+    rm -f "$URL_FILE" "$TUNNEL_PID_FILE" "$PROGRESS_FILE"
+    exit 0
+}
+trap cleanup INT TERM
+
+# ══════════════════════════════════════════════════════════════════════
+#  STEP 0: Launch GUI IMMEDIATELY — before anything else.
+#
+#  gui.py uses ONLY Python stdlib (tkinter, urllib, json) so it works
+#  with the system/brew Python. No venv needed.
+#  The GUI starts in "setup" mode showing a spinner + progress steps.
+#  It polls .setup_progress for updates and /status for server readiness.
+# ══════════════════════════════════════════════════════════════════════
+
+rm -f "$PROGRESS_FILE" "$PID_FILE" "$URL_FILE" "$TUNNEL_PID_FILE"
+> "$TUNNEL_LOG" 2>/dev/null || true
+> "$STREAMER_LOG" 2>/dev/null || true
+
+# Find a working Python for the GUI — prefer Homebrew over system Python.
+# System Python's tkinter can crash if the bundled Tk framework requires a newer macOS.
+# We test by actually creating a Tk() window, not just importing tkinter.
+GUI_PYTHON=""
+for candidate in /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3.11 /opt/homebrew/bin/python3 /usr/local/bin/python3 python3 /usr/bin/python3; do
+    if command -v "$candidate" &>/dev/null; then
+        if "$candidate" -c "
+import tkinter as tk
+try:
+    r = tk.Tk()
+    r.withdraw()
+    r.destroy()
+    print('OK')
+except:
+    pass
+" 2>/dev/null | grep -q OK; then
+            GUI_PYTHON="$candidate"
+            break
+        fi
+    fi
+done
+
+if [ -z "$GUI_PYTHON" ]; then
+    echo "No Python with working tkinter found. Attempting to install..."
+    # Try installing python-tk for whatever python3 version is available
+    if command -v brew &>/dev/null; then
+        for ver in 3.13 3.12 3.11 3.14; do
+            if command -v "/opt/homebrew/bin/python3.${ver#3.}" &>/dev/null 2>&1; then
+                brew install "python-tk@${ver}" 2>&1 || true
+                PY_BIN="/opt/homebrew/bin/python${ver}"
+                if "$PY_BIN" -c "
+import tkinter as tk
+try:
+    r = tk.Tk(); r.withdraw(); r.destroy(); print('OK')
+except: pass
+" 2>/dev/null | grep -q OK; then
+                    GUI_PYTHON="$PY_BIN"
+                    break
+                fi
+            fi
+        done
+    fi
+fi
+
+if [ -z "$GUI_PYTHON" ]; then
+    echo "FATAL: No Python with working tkinter found. Cannot show GUI."
+    alert "Canopy Streamer requires Python with tkinter.
+
+Please run in Terminal:
+  brew install python-tk@3.13"
+    exit 1
+fi
+
+# Request camera permission BEFORE anything else.
+# Use AppleScript to trigger the native macOS camera permission dialog.
+# This works because this process IS the app bundle's main executable.
+if [ -z "$SOURCE" ]; then
+    echo "Requesting camera permission..."
+    # Use swift to trigger AVFoundation camera auth — this shows the native macOS dialog
+    swift -e '
+    import AVFoundation
+    import Foundation
+    let sema = DispatchSemaphore(value: 0)
+    AVCaptureDevice.requestAccess(for: .video) { granted in
+        print(granted ? "GRANTED" : "DENIED")
+        sema.signal()
+    }
+    sema.wait()
+    ' 2>/dev/null || echo "  (camera permission request skipped)"
+fi
+
+echo "Launching GUI immediately with: $GUI_PYTHON"
+progress "checking_python"
+
+# Launch GUI in foreground-ish mode (we'll wait for it at the end)
+"$GUI_PYTHON" "$WORK_DIR/gui.py" \
+    --port "$PORT" \
+    --url-file "$URL_FILE" \
+    --pid-file "$PID_FILE" \
+    --progress-file "$PROGRESS_FILE" \
+    --config-file "$CONFIG_FILE" \
+    --api-url "$CANOPY_API" &
+GUI_PID=$!
+echo "GUI PID: $GUI_PID"
+
+# Give tkinter a moment to render the window
+sleep 0.5
+
+# ══════════════════════════════════════════════════════════════════════
+#  Now do all the heavy setup IN THE BACKGROUND while GUI is showing.
+# ══════════════════════════════════════════════════════════════════════
+
+# ── Helper: check if GUI is still alive (user might close window) ──
+gui_alive() {
+    kill -0 "$GUI_PID" 2>/dev/null
+}
+
+# ── Load saved config ──────────────────────────────────────────────────
+if [ -f "$CONFIG_FILE" ]; then
+    source "$CONFIG_FILE" 2>/dev/null || true
+    SCREEN_ID="${SAVED_SCREEN_ID:-$SCREEN_ID}"
+    API_TOKEN="${SAVED_API_TOKEN:-$API_TOKEN}"
+fi
+
+# ── Step 1: Ensure Python 3.11+ ───────────────────────────────────────
+progress "checking_python"
+
+NEED_PYTHON=0
+if command -v python3 &>/dev/null; then
+    PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "0.0")
+    PY_MAJOR=$(echo "$PY_VER" | cut -d. -f1)
+    PY_MINOR=$(echo "$PY_VER" | cut -d. -f2)
+    if [ "$PY_MAJOR" -ge 3 ] && [ "$PY_MINOR" -ge 11 ]; then
+        echo "  Found Python $PY_VER"
+    else
+        NEED_PYTHON=1
+    fi
+else
+    NEED_PYTHON=1
+fi
+
+if [ "$NEED_PYTHON" -eq 1 ]; then
+    gui_alive || exit 0
+    progress "installing_python"
+
+    if ! command -v brew &>/dev/null; then
+        progress "installing_homebrew"
+        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/null 2>&1 || true
+        if [ -f "/opt/homebrew/bin/brew" ]; then
+            eval "$(/opt/homebrew/bin/brew shellenv)"
+        elif [ -f "/usr/local/bin/brew" ]; then
+            eval "$(/usr/local/bin/brew shellenv)"
+        fi
+    fi
+
+    brew install python@3.13 2>&1 || brew install python3 2>&1 || true
+
+    if ! command -v python3 &>/dev/null; then
+        progress_error "Could not install Python. Install Python 3.11+ from python.org."
+        alert "Could not install Python. Please install Python 3.11+ from python.org and reopen the app."
+        wait "$GUI_PID" 2>/dev/null || true
+        exit 1
+    fi
+fi
+
+# ── Step 2: Ensure cloudflared ─────────────────────────────────────────
+gui_alive || exit 0
+progress "installing_cloudflared"
+export PATH="$WORK_DIR/bin:$PATH"
+
+if ! command -v cloudflared &>/dev/null; then
+    if command -v brew &>/dev/null; then
+        brew install cloudflared 2>&1 || true
+    fi
+
+    if ! command -v cloudflared &>/dev/null; then
+        ARCH=$(uname -m)
+        case "$ARCH" in
+            arm64) CF_ARCH="darwin-arm64" ;;
+            *)     CF_ARCH="darwin-amd64" ;;
+        esac
+        mkdir -p "$WORK_DIR/bin"
+        curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${CF_ARCH}.tgz" -o /tmp/cf.tgz 2>&1 || true
+        tar xzf /tmp/cf.tgz -C "$WORK_DIR/bin/" 2>/dev/null || true
+        chmod +x "$WORK_DIR/bin/cloudflared" 2>/dev/null || true
+        rm -f /tmp/cf.tgz
+    fi
+fi
+
+HAS_CLOUDFLARED=0
+if command -v cloudflared &>/dev/null; then
+    HAS_CLOUDFLARED=1
+    echo "  cloudflared ready"
+else
+    echo "  cloudflared not available — will run without tunnel"
+fi
+
+# ── Step 3: Python venv + deps ─────────────────────────────────────────
+gui_alive || exit 0
+progress "creating_venv"
+
+if [ ! -d ".venv" ]; then
+    python3 -m venv .venv || {
+        progress_error "Failed to create Python environment."
+        alert "Failed to create Python virtual environment."
+        wait "$GUI_PID" 2>/dev/null || true
+        exit 1
+    }
+fi
+
+source .venv/bin/activate
+
+if [ ! -f ".venv/.installed" ] || [ requirements.txt -nt .venv/.installed ]; then
+    progress "installing_deps"
+    pip install -q --upgrade pip 2>&1 || true
+    pip install -q -r requirements.txt 2>&1 || {
+        progress_error "Failed to install dependencies. Check internet connection."
+        alert "Failed to install Python dependencies. Check your internet connection."
+        wait "$GUI_PID" 2>/dev/null || true
+        exit 1
+    }
+    touch .venv/.installed
+fi
+
+echo "  Python environment ready"
+
+# ── Step 4: Camera check ──────────────────────────────────────────────
+gui_alive || exit 0
+progress "checking_camera"
+
+if [ -z "$SOURCE" ]; then
+    echo "  Requesting camera authorization..."
+    # Trigger the macOS camera permission dialog.
+    # We use osascript to request camera access for this app bundle — this IS the foreground app
+    # so macOS will show the native "Allow camera?" dialog.
+    osascript -e '
+    tell application "System Events"
+        -- Triggering camera access request for this app bundle
+    end tell
+    ' 2>/dev/null || true
+
+    # Now try opening the camera via OpenCV. If the user just granted permission, this will work.
+    # If not, we continue anyway — the server will retry or show black frames.
+    CAM_AUTH_RESULT=$(.venv/bin/python -c "
+import cv2, sys, os
+os.environ.pop('OPENCV_AVFOUNDATION_SKIP_AUTH', None)
+cap = cv2.VideoCapture(int('${CAMERA}'))
+if cap.isOpened():
+    ret, _ = cap.read()
+    cap.release()
+    print('OK' if ret else 'NOFRAME')
+else:
+    print('FAILED')
+" 2>&1 | tail -1)
+
+    echo "  Camera auth result: $CAM_AUTH_RESULT"
+
+    case "$CAM_AUTH_RESULT" in
+        OK)
+            echo "  Camera access granted"
+            ;;
+        *)
+            echo "  Camera check: $CAM_AUTH_RESULT — continuing anyway"
+            notify "Camera may need permission. Check System Settings > Privacy > Camera."
+            ;;
+    esac
+fi
+
+# ── Step 5: Start streamer ─────────────────────────────────────────────
+gui_alive || exit 0
+progress "starting_server"
+
+# Find free port
+if lsof -ti ":$PORT" &>/dev/null; then
+    for try_port in $(seq $((PORT + 1)) $((PORT + 20))); do
+        if ! lsof -ti ":$try_port" &>/dev/null; then
+            PORT="$try_port"
+            export PORT
+            break
+        fi
+    done
+fi
+
+source .venv/bin/activate
+
+# Use Flask dev server (not gunicorn) on macOS.
+# Gunicorn spawns worker threads that can't access the camera because
+# macOS AVFoundation requires camera init on the main thread.
+SERVER_ARGS="--port $PORT --resolution $RESOLUTION --fps $FPS"
+if [ -n "$SOURCE" ]; then
+    SERVER_ARGS="$SERVER_ARGS --source $SOURCE"
+else
+    SERVER_ARGS="$SERVER_ARGS --camera $CAMERA"
+fi
+.venv/bin/python server.py $SERVER_ARGS >> "$STREAMER_LOG" 2>&1 &
+STREAMER_PID=$!
+echo "$STREAMER_PID" > "$PID_FILE"
+
+# Wait for server
+for i in $(seq 1 60); do
+    if curl -s --max-time 2 "http://localhost:$PORT/status" >/dev/null 2>&1; then
+        echo "  Server is ready on port $PORT"
+        break
+    fi
+    if ! kill -0 "$STREAMER_PID" 2>/dev/null; then
+        progress_error "Server crashed on startup. Check logs."
+        alert "Streamer crashed. Check logs at:
+$STREAMER_LOG"
+        wait "$GUI_PID" 2>/dev/null || true
+        exit 1
+    fi
+    sleep 1
+done
+
+# ── Step 6: Cloudflare Tunnel ──────────────────────────────────────────
+gui_alive || exit 0
+
+if [ "$HAS_CLOUDFLARED" -eq 1 ]; then
+    progress "creating_tunnel"
+
+    pkill -f "cloudflared.*tunnel.*$PORT" 2>/dev/null || true
+    sleep 1
+    > "$TUNNEL_LOG"
+
+    cloudflared tunnel \
+        --url "http://localhost:$PORT" \
+        --no-autoupdate \
+        --config /dev/null \
+        >> "$TUNNEL_LOG" 2>&1 &
+    TUNNEL_PID=$!
+    echo "$TUNNEL_PID" >> "$PID_FILE"
+
+    PUBLIC_URL=""
+    for i in $(seq 1 60); do
+        PUBLIC_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$TUNNEL_LOG" 2>/dev/null | head -1 || true)
+        if [ -n "$PUBLIC_URL" ]; then break; fi
+        if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then break; fi
+        sleep 1
+    done
+
+    if [ -n "$PUBLIC_URL" ]; then
+        echo "  Tunnel URL: $PUBLIC_URL"
+        echo "$PUBLIC_URL" > "$URL_FILE"
+        echo "$TUNNEL_PID" > "$TUNNEL_PID_FILE"
+
+        # Auto-update Canopy backend
+        if [ -n "$SCREEN_ID" ] && [ -n "$API_TOKEN" ]; then
+            curl -s -o /dev/null \
+                -X PATCH "${CANOPY_API}/admin/screens/${SCREEN_ID}" \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer ${API_TOKEN}" \
+                -d "{\"stream_url\": \"${PUBLIC_URL}/stream\"}" \
+                --connect-timeout 10 --max-time 15 2>/dev/null || true
+        fi
+
+        echo -n "${PUBLIC_URL}/stream" | pbcopy 2>/dev/null || true
+        notify "Stream is live! URL copied to clipboard."
+
+        cat > "$WORK_DIR/STREAM_URL.txt" << URLEOF
+Canopy Edge Streamer — Public URL
+==================================
+
+Stream URL (paste this in Canopy admin):
+${PUBLIC_URL}/stream
+
+Dashboard: ${PUBLIC_URL}/
+Snapshot:  ${PUBLIC_URL}/frame
+Status:    ${PUBLIC_URL}/status
+
+Started: $(date)
+URLEOF
+    else
+        echo "  Tunnel failed — running locally only"
+        notify "Tunnel failed. Streamer running at http://localhost:$PORT"
+    fi
+fi
+
+# ── Step 7: All ready! ────────────────────────────────────────────────
+progress "ready"
+echo ""
+echo "=== All systems go! ==="
+echo ""
+
+# Prevent sleep
+caffeinate -s &
+echo $! >> "$PID_FILE"
+
+# ── Step 8: Watchdog ──────────────────────────────────────────────────
+
+watchdog_loop() {
+    local streamer_failures=0
+    while gui_alive; do
+        sleep 30
+
+        if ! curl -s --max-time 3 "http://localhost:$PORT/status" >/dev/null 2>&1; then
+            streamer_failures=$((streamer_failures + 1))
+            if [ $streamer_failures -ge 3 ]; then
+                notify "Streamer issue detected. Restarting..."
+                # Restart streamer inline
+                source .venv/bin/activate
+                SERVER_ARGS="--port $PORT --resolution $RESOLUTION --fps $FPS"
+                if [ -n "$SOURCE" ]; then
+                    SERVER_ARGS="$SERVER_ARGS --source $SOURCE"
+                else
+                    SERVER_ARGS="$SERVER_ARGS --camera $CAMERA"
+                fi
+                .venv/bin/python server.py $SERVER_ARGS >> "$STREAMER_LOG" 2>&1 &
+                echo $! > "$PID_FILE"
+                streamer_failures=0
+            fi
+        else
+            streamer_failures=0
+        fi
+
+        if [ -f "$TUNNEL_PID_FILE" ]; then
+            T_PID=$(cat "$TUNNEL_PID_FILE")
+            if [ -n "$T_PID" ] && ! kill -0 "$T_PID" 2>/dev/null; then
+                notify "Tunnel reconnecting..."
+                sleep 3
+                > "$TUNNEL_LOG"
+                cloudflared tunnel --url "http://localhost:$PORT" --no-autoupdate --config /dev/null >> "$TUNNEL_LOG" 2>&1 &
+                NEW_T_PID=$!
+                echo "$NEW_T_PID" >> "$PID_FILE"
+                echo "$NEW_T_PID" > "$TUNNEL_PID_FILE"
+            fi
+        fi
+    done
+}
+
+watchdog_loop &
+WATCHDOG_PID=$!
+echo "$WATCHDOG_PID" >> "$PID_FILE"
+
+# ── Wait for GUI to exit (user closes window) ─────────────────────────
+wait "$GUI_PID" 2>/dev/null || true
+echo "GUI exited at $(date). Cleaning up..."
+cleanup

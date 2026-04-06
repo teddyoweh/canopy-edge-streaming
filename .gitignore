@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+logs/
+*.app
+*.dmg
+*.zip
+STREAM_URL.txt
+.public_url
+.pids
+.tunnel_pid
+.lock
+.venv/.installed
