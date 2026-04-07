@@ -586,14 +586,21 @@ pick_camera() {
         return
     fi
 
-    # Check for saved camera in .config
+    # Check for saved camera in .config — ask user to confirm or re-pick
     if [ -f "$CONFIG_FILE" ]; then
         source "$CONFIG_FILE"
         if [ -n "${SAVED_CAMERA:-}" ]; then
-            CAMERA="$SAVED_CAMERA"
-            export CAMERA
-            ok "Using saved camera: ${SAVED_CAMERA_NAME:-Camera $CAMERA}"
-            return
+            echo ""
+            echo -e "  ${BOLD}Previously used:${NC} ${SAVED_CAMERA_NAME:-Camera $SAVED_CAMERA}"
+            echo -ne "  ${BOLD}Use same camera?${NC} ${DIM}(Y/n):${NC} "
+            read -r USE_SAVED < /dev/tty
+            if [[ "$USE_SAVED" != "n" && "$USE_SAVED" != "N" ]]; then
+                CAMERA="$SAVED_CAMERA"
+                export CAMERA
+                ok "Using saved camera: ${SAVED_CAMERA_NAME:-Camera $CAMERA}"
+                return
+            fi
+            # User said no — fall through to camera picker
         fi
     fi
 
