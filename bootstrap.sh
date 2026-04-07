@@ -3,10 +3,10 @@
 #  One-liner installer — downloads the edge streamer from GitHub and runs it.
 #
 #  macOS / Linux (curl — recommended on Mac, no wget by default):
-#    curl -fsSL https://raw.githubusercontent.com/teddyoweh/canopyads/main/edge_streaming/bootstrap.sh | bash
+#    curl -fsSL https://raw.githubusercontent.com/teddyoweh/canopy-edge-streaming/main/bootstrap.sh | bash
 #
 #  Linux (wget):
-#    wget -qO- https://raw.githubusercontent.com/teddyoweh/canopyads/main/edge_streaming/bootstrap.sh | bash
+#    wget -qO- https://raw.githubusercontent.com/teddyoweh/canopy-edge-streaming/main/bootstrap.sh | bash
 #
 #  Override install directory:
 #    CANOPY_EDGE_DIR=~/Desktop/canopy-edge curl -fsSL ... | bash
@@ -16,7 +16,7 @@
 # ─────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-CANOPY_EDGE_RAW_BASE="${CANOPY_EDGE_RAW_BASE:-https://raw.githubusercontent.com/teddyoweh/canopyads/main/edge_streaming}"
+CANOPY_EDGE_RAW_BASE="${CANOPY_EDGE_RAW_BASE:-https://raw.githubusercontent.com/teddyoweh/canopy-edge-streaming/main}"
 INSTALL_DIR="${CANOPY_EDGE_DIR:-$HOME/canopy-edge-streaming}"
 
 need_cmd() {
