@@ -31,7 +31,9 @@ logger = logging.getLogger("edge_streaming")
 app = Flask(__name__)
 
 _lock = threading.Lock()
+_new_frame = threading.Event()
 _latest_frame: bytes | None = None
+_frame_seq: int = 0
 _frame_count: int = 0
 _fps: float = 0.0
 _running: bool = True
@@ -230,7 +232,7 @@ def capture_loop(source, resolution: tuple[int, int] | None, target_fps: int):
 
         # Encode frame to JPEG — handle failure gracefully
         try:
-            ok_enc, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            ok_enc, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
             if not ok_enc:
                 logger.warning("JPEG encoding failed, skipping frame")
                 continue
@@ -242,6 +244,8 @@ def capture_loop(source, resolution: tuple[int, int] | None, target_fps: int):
         with _lock:
             _latest_frame = jpeg_bytes
             _frame_count += 1
+            _frame_seq += 1
+        _new_frame.set()
 
         fps_count += 1
         elapsed = time.monotonic() - fps_start
@@ -251,7 +255,10 @@ def capture_loop(source, resolution: tuple[int, int] | None, target_fps: int):
             fps_count = 0
             fps_start = time.monotonic()
 
-        if interval > 0:
+        # Only throttle if capturing faster than target fps.
+        # cap.read() on real cameras already blocks at native rate,
+        # so we only sleep for file/RTSP sources exceeding target.
+        if interval > 0 and not isinstance(source, int):
             time.sleep(interval)
 
     cap.release()
@@ -259,17 +266,23 @@ def capture_loop(source, resolution: tuple[int, int] | None, target_fps: int):
 
 
 def _generate_mjpeg():
+    last_seq = -1
     while _running:
+        # Wait for a new frame instead of polling with sleep
+        _new_frame.wait(timeout=0.5)
+        _new_frame.clear()
         with _lock:
             frame = _latest_frame
+            seq = _frame_seq
         if frame is None:
-            time.sleep(0.05)
             continue
+        if seq == last_seq:
+            continue  # skip duplicate — no new frame yet
+        last_seq = seq
         yield (
             b"--frame\r\n"
             b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
         )
-        time.sleep(0.033)
 
 
 # ── Routes ──────────────────────────────────────────────────────────────
