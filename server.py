@@ -28,6 +28,24 @@ from flask import Flask, Response, jsonify, render_template_string, request, abo
 
 logger = logging.getLogger("edge_streaming")
 
+# ── Fast JPEG encoding ────────────────────────────────────────────────
+# TurboJPEG is 3-5x faster than cv2.imencode. Falls back to cv2 if unavailable.
+_tj = None
+try:
+    from turbojpeg import TurboJPEG
+    _tj = TurboJPEG()
+    logger.info("TurboJPEG available — using hardware-accelerated JPEG encoding")
+except Exception:
+    pass
+
+_JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "50"))
+
+def _encode_jpeg(frame, quality: int = _JPEG_QUALITY) -> bytes | None:
+    if _tj is not None:
+        return _tj.encode(frame, quality=quality)
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    return buf.tobytes() if ok else None
+
 app = Flask(__name__)
 
 _lock = threading.Lock()
@@ -230,13 +248,12 @@ def capture_loop(source, resolution: tuple[int, int] | None, target_fps: int):
         except Exception:
             pass
 
-        # Encode frame to JPEG — handle failure gracefully
+        # Encode frame to JPEG — use TurboJPEG when available (3-5x faster)
         try:
-            ok_enc, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
-            if not ok_enc:
+            jpeg_bytes = _encode_jpeg(frame)
+            if jpeg_bytes is None:
                 logger.warning("JPEG encoding failed, skipping frame")
                 continue
-            jpeg_bytes = jpeg.tobytes()
         except Exception as e:
             logger.warning("Frame encoding error: %s", e)
             continue
@@ -279,9 +296,13 @@ def _generate_mjpeg():
         if seq == last_seq:
             continue  # skip duplicate — no new frame yet
         last_seq = seq
+        # Content-Length tells the browser exactly how many bytes to expect
+        # — eliminates buffering/guessing and renders the frame instantly
         yield (
             b"--frame\r\n"
-            b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+            b"Content-Type: image/jpeg\r\n"
+            b"Content-Length: " + str(len(frame)).encode() + b"\r\n\r\n"
+            + frame + b"\r\n"
         )
 
 
@@ -316,6 +337,8 @@ def stream():
     )
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     resp.headers["X-Accel-Buffering"] = "no"
+    resp.headers["Connection"] = "keep-alive"
+    resp.headers["Pragma"] = "no-cache"
     return resp
 
 
@@ -457,7 +480,7 @@ def main():
     parser.add_argument("--camera", type=int, default=0, help="Camera index (default: 0)")
     parser.add_argument("--source", type=str, default=None, help="Video file or RTSP URL instead of camera")
     parser.add_argument("--resolution", type=str, default="640x480", help="Resolution WxH (default: 640x480)")
-    parser.add_argument("--fps", type=int, default=15, help="Target FPS (default: 15)")
+    parser.add_argument("--fps", type=int, default=30, help="Target FPS (default: 30)")
     parser.add_argument("--port", type=int, default=8554, help="Server port (default: 8554)")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
     args = parser.parse_args()
@@ -500,7 +523,9 @@ def main():
 
     cap_thread = threading.Thread(target=capture_loop, args=(source, res, args.fps), daemon=True)
     cap_thread.start()
-    time.sleep(1)
+
+    # Wait for first frame instead of arbitrary sleep
+    _new_frame.wait(timeout=3)
 
     ip = _get_local_ip()
     token_hint = ""
@@ -519,7 +544,19 @@ def main():
 """)
 
     app.config["PORT"] = args.port
-    app.run(host=args.host, port=args.port, threaded=True)
+
+    # Disable Werkzeug's output buffering and enable TCP_NODELAY
+    # so frames are pushed to the wire immediately
+    from werkzeug.serving import WSGIRequestHandler
+    WSGIRequestHandler.protocol_version = "HTTP/1.1"
+    import socket as _socket
+
+    class NoDelayHandler(WSGIRequestHandler):
+        def setup(self):
+            super().setup()
+            self.request.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
+
+    app.run(host=args.host, port=args.port, threaded=True, request_handler=NoDelayHandler)
 
 
 if __name__ == "__main__":
