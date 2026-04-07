@@ -320,18 +320,18 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# ── Step 1: Ensure Python 3.11+ exists ─────────────────────────────────
+# ── Step 1: Ensure Python 3 exists (any version >= 3.8) ──────────────
 ensure_python() {
-    # Check if python3 exists and is 3.11+
+    # Accept any Python 3.8+ — don't force a specific minor version
     if command -v python3 &>/dev/null; then
         PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "0.0")
         PY_MAJOR=$(echo "$PY_VER" | cut -d. -f1)
         PY_MINOR=$(echo "$PY_VER" | cut -d. -f2)
-        if [ "$PY_MAJOR" -ge 3 ] && [ "$PY_MINOR" -ge 11 ]; then
+        if [ "$PY_MAJOR" -ge 3 ] && [ "$PY_MINOR" -ge 8 ]; then
             ok "Python $PY_VER found"
             return
         fi
-        warn "Python $PY_VER found but 3.11+ required"
+        warn "Python $PY_VER is too old (need 3.8+)"
     fi
 
     log "Installing Python..."
@@ -347,13 +347,19 @@ ensure_python() {
                 echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile
             fi
         fi
-        brew install python@3.13 2>/dev/null || brew install python3
+        # Try the latest stable, then fall back to whatever is available
+        brew install python@3.13 2>/dev/null || brew install python@3.12 2>/dev/null || brew install python3
+        # macOS: also install libturbojpeg for fast JPEG encoding (optional)
+        brew install jpeg-turbo 2>/dev/null || true
     elif [ "$OS" = "Linux" ]; then
         if command -v apt-get &>/dev/null; then
             safe_sudo apt-get update -qq
-            safe_sudo apt-get install -y -qq python3 python3-venv python3-pip
+            safe_sudo apt-get install -y -qq python3 python3-venv python3-pip python3-dev
+            # libturbojpeg for fast JPEG (optional)
+            safe_sudo apt-get install -y -qq libturbojpeg0-dev 2>/dev/null || true
         elif command -v dnf &>/dev/null; then
-            safe_sudo dnf install -y python3 python3-pip
+            safe_sudo dnf install -y python3 python3-pip python3-devel
+            safe_sudo dnf install -y turbojpeg-devel 2>/dev/null || true
         elif command -v pacman &>/dev/null; then
             safe_sudo pacman -Sy --noconfirm python python-pip
         fi
@@ -362,7 +368,7 @@ ensure_python() {
     if command -v python3 &>/dev/null; then
         ok "Python installed: $(python3 --version)"
     else
-        err "Failed to install Python. Please install Python 3.11+ manually."
+        err "Failed to install Python. Please install Python 3.8+ manually."
         exit 1
     fi
 }
@@ -419,116 +425,151 @@ ensure_cloudflared() {
 }
 
 # ── Step 3: Setup Python venv + deps ────────────────────────────────────
+_bootstrap_pip() {
+    # Get pip into the venv by any means necessary
+    local py="$1"
+    if $py -m pip --version &>/dev/null; then
+        return 0
+    fi
+    log "Bootstrapping pip..."
+    # Method 1: ensurepip (works on most Python installs)
+    $py -m ensurepip --upgrade 2>/dev/null && return 0
+    # Method 2: get-pip.py via curl
+    curl -fsSL https://bootstrap.pypa.io/get-pip.py -o /tmp/_get_pip.py 2>/dev/null \
+        && $py /tmp/_get_pip.py 2>/dev/null && rm -f /tmp/_get_pip.py && return 0
+    # Method 3: get-pip.py via python urllib
+    $py -c "import urllib.request; urllib.request.urlretrieve('https://bootstrap.pypa.io/get-pip.py', '/tmp/_get_pip.py')" 2>/dev/null \
+        && $py /tmp/_get_pip.py 2>/dev/null && rm -f /tmp/_get_pip.py && return 0
+    return 1
+}
+
+_install_pkg() {
+    # Install a single package with verbose error on failure
+    local pip_cmd="$1"
+    local pkg="$2"
+    local required="$3"  # "required" or "optional"
+
+    if $pip_cmd install -q "$pkg" 2>/dev/null; then
+        return 0
+    fi
+    # Retry without version constraint
+    local base_pkg
+    base_pkg=$(echo "$pkg" | sed 's/[><=!].*//')
+    if [ "$base_pkg" != "$pkg" ]; then
+        if $pip_cmd install -q "$base_pkg" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    if [ "$required" = "required" ]; then
+        err "Failed to install $pkg"
+    else
+        warn "$pkg not available (optional — skipping)"
+    fi
+    return 1
+}
+
 setup_venv() {
-    # Check if existing venv's Python actually works on THIS machine
-    # (breaks when the folder is copied from a machine with a different Python version)
+    local VENV_PY=".venv/bin/python"
+
+    # ── 1. Check if existing venv works ──
     if [ -d ".venv" ]; then
-        if ! .venv/bin/python -c "import sys" 2>/dev/null; then
-            warn "Existing venv is broken (likely from a different machine/Python version). Rebuilding..."
+        if ! $VENV_PY -c "import sys" 2>/dev/null; then
+            warn "Existing venv is broken (wrong Python version?). Rebuilding..."
             rm -rf .venv
         fi
     fi
 
-    if [ ! -d ".venv" ] || [ ! -f ".venv/bin/activate" ]; then
+    # ── 2. Create venv if needed ──
+    if [ ! -f ".venv/bin/activate" ]; then
         rm -rf .venv 2>/dev/null || true
         log "Creating Python virtual environment..."
 
-        # Try standard venv first
-        if python3 -m venv .venv 2>/dev/null && [ -f ".venv/bin/activate" ]; then
+        # Try standard venv
+        if python3 -m venv .venv 2>&1 | tee -a "$MAIN_LOG" && [ -f ".venv/bin/activate" ]; then
             ok "venv created"
-        # Fallback: venv without pip, then bootstrap pip manually
-        elif python3 -m venv --without-pip .venv 2>/dev/null && [ -f ".venv/bin/activate" ]; then
-            warn "Created venv without pip — bootstrapping pip..."
-            source .venv/bin/activate
-            curl -fsSL https://bootstrap.pypa.io/get-pip.py | python3 2>/dev/null || {
-                # Last resort: download get-pip and run it
-                python3 -c "import urllib.request; urllib.request.urlretrieve('https://bootstrap.pypa.io/get-pip.py', '/tmp/get-pip.py')" 2>/dev/null
-                python3 /tmp/get-pip.py 2>/dev/null || true
-            }
         else
-            err "Failed to create virtual environment."
-            err "  On macOS: brew install python3"
-            err "  On Linux: sudo apt install python3-venv python3-pip"
+            rm -rf .venv 2>/dev/null || true
+            # Fallback: --without-pip (works when ensurepip is missing)
+            if python3 -m venv --without-pip .venv 2>/dev/null && [ -f ".venv/bin/activate" ]; then
+                ok "venv created (without pip — will bootstrap)"
+            else
+                rm -rf .venv 2>/dev/null || true
+                # Last resort on Linux: install python3-venv package and retry
+                if [ "$(uname -s)" = "Linux" ] && command -v apt-get &>/dev/null; then
+                    warn "venv module missing — installing python3-venv..."
+                    safe_sudo apt-get install -y -qq python3-venv 2>/dev/null
+                    python3 -m venv .venv 2>/dev/null || python3 -m venv --without-pip .venv 2>/dev/null
+                fi
+            fi
+        fi
+
+        if [ ! -f ".venv/bin/activate" ]; then
+            err "Cannot create virtual environment."
+            err "  macOS:  brew install python3"
+            err "  Ubuntu: sudo apt install python3-venv"
+            err "  Fedora: sudo dnf install python3"
             exit 1
         fi
     fi
 
-    # Verify activate script exists before sourcing
-    if [ ! -f ".venv/bin/activate" ]; then
-        err "venv/bin/activate not found after creation — Python installation may be broken."
-        err "  Try: brew reinstall python3  (macOS) or sudo apt install python3-venv (Linux)"
+    # ── 3. Activate and ensure pip ──
+    source .venv/bin/activate
+
+    if ! _bootstrap_pip "$VENV_PY"; then
+        err "Cannot install pip in venv."
+        err "  Try manually: curl https://bootstrap.pypa.io/get-pip.py | $VENV_PY"
         exit 1
     fi
 
-    source .venv/bin/activate
-
-    # Ensure pip is available in the venv
-    if ! command -v pip &>/dev/null && ! .venv/bin/python -m pip --version &>/dev/null; then
-        log "pip missing in venv — bootstrapping..."
-        curl -fsSL https://bootstrap.pypa.io/get-pip.py | .venv/bin/python 2>/dev/null || {
-            err "Cannot install pip. Try: python3 -m ensurepip"
-            exit 1
-        }
-    fi
-
-    # Use python -m pip to be safe (works even if pip script is missing)
-    PIP=".venv/bin/python -m pip"
+    # ── 4. Install dependencies ──
+    local PIP="$VENV_PY -m pip"
 
     if [ ! -f ".venv/.installed" ] || [ requirements.txt -nt .venv/.installed ]; then
         log "Installing Python dependencies..."
-        $PIP install -q --upgrade pip 2>/dev/null || true
+        $PIP install -q --upgrade pip setuptools wheel 2>/dev/null || true
 
-        # Core packages — must succeed
-        CORE_PKGS="opencv-python-headless flask numpy requests gunicorn"
-        # Optional packages — nice to have, not fatal
-        OPT_PKGS="PyTurboJPEG"
+        # Try batch install first (fastest path)
+        if $PIP install -q -r requirements.txt 2>/dev/null; then
+            ok "All dependencies installed"
+        else
+            warn "Batch install failed — installing individually..."
 
-        if ! $PIP install -q -r requirements.txt 2>/dev/null; then
-            warn "Batch install failed. Installing packages individually..."
+            # Core: must succeed or we can't run
+            _install_pkg "$PIP" "flask" "required"
+            _install_pkg "$PIP" "numpy" "required"
+            _install_pkg "$PIP" "requests" "required"
+            _install_pkg "$PIP" "gunicorn" "required"
 
-            for pkg in $CORE_PKGS; do
-                if ! $PIP install -q "$pkg" 2>/dev/null; then
-                    # opencv fallback: try different package names
-                    if echo "$pkg" | grep -qi "opencv"; then
-                        warn "opencv-python-headless failed, trying opencv-python..."
-                        $PIP install -q "opencv-python" 2>/dev/null || {
-                            err "Failed to install OpenCV. Camera streaming will not work."
-                        }
-                    else
-                        warn "Failed to install: $pkg — retrying with no version constraint..."
-                        # Strip version specifier and retry
-                        base_pkg=$(echo "$pkg" | sed 's/[><=!].*//')
-                        $PIP install -q "$base_pkg" 2>/dev/null || {
-                            err "Cannot install $base_pkg"
-                        }
-                    fi
-                fi
-            done
+            # OpenCV: try multiple package names (binary compat varies by platform/Python)
+            if ! $VENV_PY -c "import cv2" 2>/dev/null; then
+                log "Installing OpenCV..."
+                $PIP install -q "opencv-python-headless" 2>/dev/null \
+                    || $PIP install -q "opencv-python" 2>/dev/null \
+                    || $PIP install -q "opencv-contrib-python-headless" 2>/dev/null \
+                    || $PIP install -q "opencv-contrib-python" 2>/dev/null \
+                    || err "Failed to install OpenCV"
+            fi
 
-            for pkg in $OPT_PKGS; do
-                $PIP install -q "$pkg" 2>/dev/null || {
-                    warn "$pkg not available (optional — will use cv2 fallback)"
-                }
-            done
+            # Optional: TurboJPEG (3-5x faster encoding, needs libturbojpeg)
+            _install_pkg "$PIP" "PyTurboJPEG" "optional"
         fi
 
-        # Verify critical imports
-        if ! .venv/bin/python -c "import cv2" 2>/dev/null; then
+        # ── 5. Verify critical imports ──
+        if ! $VENV_PY -c "import cv2" 2>/dev/null; then
             err "OpenCV (cv2) not importable. Camera will not work."
-            err "  Try: .venv/bin/python -m pip install opencv-python-headless"
+            err "  Try: $PIP install opencv-python-headless"
             exit 1
         fi
-        if ! .venv/bin/python -c "import flask" 2>/dev/null; then
+        if ! $VENV_PY -c "import flask" 2>/dev/null; then
             err "Flask not importable. Server will not start."
-            err "  Try: .venv/bin/python -m pip install flask"
+            err "  Try: $PIP install flask"
             exit 1
         fi
 
         touch .venv/.installed
-        ok "All dependencies installed"
     fi
 
-    ok "Python environment ready"
+    ok "Python environment ready ($($VENV_PY --version 2>&1))"
 }
 
 # ── Camera picker — interactive camera selection ───────────────────────
