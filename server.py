@@ -174,7 +174,7 @@ def _safe_stats() -> tuple[float, int]:
 # ── Capture thread ──────────────────────────────────────────────────────
 
 def capture_loop(source, resolution: tuple[int, int] | None, target_fps: int):
-    global _latest_frame, _frame_count, _fps, _running, _camera_info
+    global _latest_frame, _frame_count, _frame_seq, _fps, _running, _camera_info
 
     if isinstance(source, int):
         cap = cv2.VideoCapture(source)
