@@ -201,7 +201,7 @@ ensure_camera_access() {
             if ! id -nG | grep -qw video; then
                 warn "Your user is not in the 'video' group."
                 echo -ne "  ${BOLD}Add yourself to the video group? ${NC}${DIM}(Y/n):${NC} "
-                read -r ADD_VIDEO
+                read -r ADD_VIDEO < /dev/tty
                 if [[ "$ADD_VIDEO" != "n" && "$ADD_VIDEO" != "N" ]]; then
                     safe_sudo usermod -aG video "$USER"
                     ok "Added $USER to video group. You may need to log out and back in."
@@ -661,7 +661,7 @@ print(json.dumps(cameras))
         warn "  - On macOS, check System Settings > Privacy > Camera"
         echo ""
         echo -ne "  ${BOLD}Enter a video file path or RTSP URL${NC} ${DIM}(or Enter to use Camera 0):${NC} "
-        read -r MANUAL_SOURCE
+        read -r MANUAL_SOURCE < /dev/tty
         if [ -n "$MANUAL_SOURCE" ]; then
             SOURCE="$MANUAL_SOURCE"
             export SOURCE
@@ -672,19 +672,7 @@ print(json.dumps(cameras))
         return
     fi
 
-    if [ "$CAM_COUNT" -eq 1 ]; then
-        # Auto-select the only camera
-        CAMERA=$(echo "$CAMERA_LIST" | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['index'])")
-        local CAM_NAME
-        CAM_NAME=$(echo "$CAMERA_LIST" | python3 -c "import sys,json; c=json.load(sys.stdin)[0]; print(f\"{c['name']} ({c['resolution']})\")")
-        export CAMERA
-        ok "Auto-selected: $CAM_NAME"
-        # Save to config
-        _save_camera_choice "$CAMERA" "$CAM_NAME"
-        return
-    fi
-
-    # Multiple cameras — show picker
+    # Always show camera picker — even with 1 camera, let user confirm
     echo ""
     echo -e "  ${CYAN}${BOLD}  ┌──────────────────────────────────────────┐${NC}"
     echo -e "  ${CYAN}${BOLD}  │   SELECT A CAMERA                       │${NC}"
@@ -699,7 +687,7 @@ print(f'    {len(cams)+1}. Enter video file or RTSP URL')
 "
     echo ""
     echo -ne "  ${BOLD}Select camera #${NC} ${DIM}(1-$((CAM_COUNT+1))):${NC} "
-    read -r CAM_CHOICE
+    read -r CAM_CHOICE < /dev/tty
 
     # Default to first camera if empty
     if [ -z "$CAM_CHOICE" ]; then
@@ -709,7 +697,7 @@ print(f'    {len(cams)+1}. Enter video file or RTSP URL')
     # Check if they picked the "manual source" option
     if [ "$CAM_CHOICE" -eq "$((CAM_COUNT+1))" ] 2>/dev/null; then
         echo -ne "  ${BOLD}Enter path or URL:${NC} "
-        read -r MANUAL_SOURCE
+        read -r MANUAL_SOURCE < /dev/tty
         if [ -n "$MANUAL_SOURCE" ]; then
             SOURCE="$MANUAL_SOURCE"
             export SOURCE
@@ -1081,7 +1069,7 @@ interactive_setup() {
     # Ask: do you want to register? (skip prompt if re-registering a deleted screen)
     if [ "${AUTO_REGISTER:-false}" != "true" ]; then
         echo -ne "  ${BOLD}Register this screen in Canopy? ${NC}${DIM}(Y/n):${NC} "
-        read -r DO_REGISTER
+        read -r DO_REGISTER < /dev/tty
         if [[ "$DO_REGISTER" == "n" || "$DO_REGISTER" == "N" ]]; then
             log "Skipping registration. You can set the stream URL manually."
             return
@@ -1108,12 +1096,12 @@ interactive_setup() {
     else
         echo ""
         echo -ne "  ${BOLD}Screen name${NC} ${DIM}(e.g. \"Dubai Mall Entrance\"):${NC} "
-        read -r SCREEN_NAME
+        read -r SCREEN_NAME < /dev/tty
         SCREEN_NAME="${SCREEN_NAME:-Screen $(date +%s)}"
         echo -ne "  ${BOLD}City${NC} ${DIM}(e.g. \"Dubai\"):${NC} "
-        read -r SCREEN_CITY
+        read -r SCREEN_CITY < /dev/tty
         echo -ne "  ${BOLD}Zone${NC} ${DIM}(e.g. \"Mall Entrance\"):${NC} "
-        read -r SCREEN_ZONE
+        read -r SCREEN_ZONE < /dev/tty
     fi
 
     # List campaigns and auto-select default
@@ -1195,7 +1183,7 @@ print(c['id'] + '|' + c['name'])
         if [ "$AUTO_SELECTED" = "false" ]; then
             echo ""
             echo -ne "  ${BOLD}Assign to campaign #${NC} ${DIM}(number, or Enter to skip):${NC} "
-            read -r CAMP_NUM
+            read -r CAMP_NUM < /dev/tty
             if [ -n "$CAMP_NUM" ]; then
                 MATCH=$(echo "$CAMPAIGNS" | python3 -c "
 import sys, json
@@ -1294,6 +1282,26 @@ main() {
     # Step 3.6: Camera access + selection
     ensure_camera_access
     pick_camera
+
+    # ── Confirm before starting ──
+    echo ""
+    echo -e "  ${BOLD}Ready to stream:${NC}"
+    if [ -n "$SOURCE" ]; then
+        echo -e "    Source:     ${CYAN}$SOURCE${NC}"
+    else
+        echo -e "    Camera:     ${CYAN}$CAMERA${NC}"
+    fi
+    echo -e "    Resolution: ${CYAN}$RESOLUTION${NC}"
+    echo -e "    FPS:        ${CYAN}$FPS${NC}"
+    echo -e "    Port:       ${CYAN}$PORT${NC}"
+    echo ""
+    echo -ne "  ${BOLD}Start streaming?${NC} ${DIM}(Y/n):${NC} "
+    read -r CONFIRM_START < /dev/tty
+    if [[ "$CONFIRM_START" == "n" || "$CONFIRM_START" == "N" ]]; then
+        log "Aborted by user."
+        exit 0
+    fi
+    echo ""
 
     # Step 4: Start streamer
     if ! start_streamer; then

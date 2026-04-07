@@ -3,10 +3,10 @@
 #  One-liner installer — downloads the edge streamer from GitHub and runs it.
 #
 #  macOS / Linux (curl — recommended on Mac, no wget by default):
-#    curl -fsSL https://raw.githubusercontent.com/teddyoweh/canopy-edge-streaming/main/bootstrap.sh | bash
+#    curl -fsSL https://raw.githubusercontent.com/teddyoweh/canopyads/main/edge_streaming/bootstrap.sh | bash
 #
 #  Linux (wget):
-#    wget -qO- https://raw.githubusercontent.com/teddyoweh/canopy-edge-streaming/main/bootstrap.sh | bash
+#    wget -qO- https://raw.githubusercontent.com/teddyoweh/canopyads/main/edge_streaming/bootstrap.sh | bash
 #
 #  Override install directory:
 #    CANOPY_EDGE_DIR=~/Desktop/canopy-edge curl -fsSL ... | bash
@@ -16,7 +16,7 @@
 # ─────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-CANOPY_EDGE_RAW_BASE="${CANOPY_EDGE_RAW_BASE:-https://raw.githubusercontent.com/teddyoweh/canopy-edge-streaming/main}"
+CANOPY_EDGE_RAW_BASE="${CANOPY_EDGE_RAW_BASE:-https://raw.githubusercontent.com/teddyoweh/canopyads/main/edge_streaming}"
 INSTALL_DIR="${CANOPY_EDGE_DIR:-$HOME/canopy-edge-streaming}"
 
 need_cmd() {
@@ -45,4 +45,6 @@ if [ "$(uname -s)" = "Darwin" ]; then
 fi
 
 echo "→ Starting run.sh ..."
-exec bash ./run.sh "$@"
+# Re-attach stdin to the terminal so interactive prompts work
+# (curl ... | bash consumes stdin — run.sh needs the real keyboard)
+exec bash ./run.sh "$@" </dev/tty
