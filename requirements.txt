@@ -1,6 +1,7 @@
-opencv-python>=4.9.0
-flask>=3.0.0
-numpy>=1.26
-requests>=2.31.0
-gunicorn>=22.0.0
-PyTurboJPEG>=1.7.0
+opencv-python-headless
+flask
+numpy
+requests
+gunicorn
+# Optional — 3-5x faster JPEG encoding. Falls back to cv2 if unavailable.
+PyTurboJPEG

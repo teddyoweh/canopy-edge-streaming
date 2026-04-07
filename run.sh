@@ -15,10 +15,10 @@
 #    bash run.sh
 #
 #  One-liner (avoids WhatsApp/iMessage quarantine — downloads from GitHub):
-#    curl -fsSL https://raw.githubusercontent.com/teddyoweh/canopy-edge-streaming/main/bootstrap.sh | bash
+#    curl -fsSL https://raw.githubusercontent.com/teddyoweh/canopyads/main/edge_streaming/bootstrap.sh | bash
 #
 #  wget (Linux):
-#    wget -qO- https://raw.githubusercontent.com/teddyoweh/canopy-edge-streaming/main/bootstrap.sh | bash
+#    wget -qO- https://raw.githubusercontent.com/teddyoweh/canopyads/main/edge_streaming/bootstrap.sh | bash
 #
 #  Custom install folder:
 #    CANOPY_EDGE_DIR=~/Desktop/canopy-edge curl -fsSL .../bootstrap.sh | bash
@@ -429,53 +429,103 @@ setup_venv() {
         fi
     fi
 
-    if [ ! -d ".venv" ]; then
+    if [ ! -d ".venv" ] || [ ! -f ".venv/bin/activate" ]; then
+        rm -rf .venv 2>/dev/null || true
         log "Creating Python virtual environment..."
-        python3 -m venv .venv || {
-            err "Failed to create venv. Trying with --without-pip..."
-            python3 -m venv --without-pip .venv
-        }
+
+        # Try standard venv first
+        if python3 -m venv .venv 2>/dev/null && [ -f ".venv/bin/activate" ]; then
+            ok "venv created"
+        # Fallback: venv without pip, then bootstrap pip manually
+        elif python3 -m venv --without-pip .venv 2>/dev/null && [ -f ".venv/bin/activate" ]; then
+            warn "Created venv without pip — bootstrapping pip..."
+            source .venv/bin/activate
+            curl -fsSL https://bootstrap.pypa.io/get-pip.py | python3 2>/dev/null || {
+                # Last resort: download get-pip and run it
+                python3 -c "import urllib.request; urllib.request.urlretrieve('https://bootstrap.pypa.io/get-pip.py', '/tmp/get-pip.py')" 2>/dev/null
+                python3 /tmp/get-pip.py 2>/dev/null || true
+            }
+        else
+            err "Failed to create virtual environment."
+            err "  On macOS: brew install python3"
+            err "  On Linux: sudo apt install python3-venv python3-pip"
+            exit 1
+        fi
+    fi
+
+    # Verify activate script exists before sourcing
+    if [ ! -f ".venv/bin/activate" ]; then
+        err "venv/bin/activate not found after creation — Python installation may be broken."
+        err "  Try: brew reinstall python3  (macOS) or sudo apt install python3-venv (Linux)"
+        exit 1
     fi
 
     source .venv/bin/activate
 
+    # Ensure pip is available in the venv
+    if ! command -v pip &>/dev/null && ! .venv/bin/python -m pip --version &>/dev/null; then
+        log "pip missing in venv — bootstrapping..."
+        curl -fsSL https://bootstrap.pypa.io/get-pip.py | .venv/bin/python 2>/dev/null || {
+            err "Cannot install pip. Try: python3 -m ensurepip"
+            exit 1
+        }
+    fi
+
+    # Use python -m pip to be safe (works even if pip script is missing)
+    PIP=".venv/bin/python -m pip"
+
     if [ ! -f ".venv/.installed" ] || [ requirements.txt -nt .venv/.installed ]; then
         log "Installing Python dependencies..."
-        pip install -q --upgrade pip 2>/dev/null || true
+        $PIP install -q --upgrade pip 2>/dev/null || true
 
-        if ! pip install -q -r requirements.txt 2>/dev/null; then
-            warn "Batch install failed. Trying packages individually..."
-            while IFS= read -r pkg || [ -n "$pkg" ]; do
-                # Skip comments and empty lines
-                pkg=$(echo "$pkg" | sed 's/#.*//' | xargs)
-                [ -z "$pkg" ] && continue
-                if ! pip install -q "$pkg" 2>/dev/null; then
-                    # Special fallback for opencv
-                    if echo "$pkg" | grep -qi "opencv-python"; then
-                        warn "opencv-python failed, trying opencv-python-headless..."
-                        pip install -q "opencv-python-headless>=4.9.0" 2>/dev/null || {
+        # Core packages — must succeed
+        CORE_PKGS="opencv-python-headless flask numpy requests gunicorn"
+        # Optional packages — nice to have, not fatal
+        OPT_PKGS="PyTurboJPEG"
+
+        if ! $PIP install -q -r requirements.txt 2>/dev/null; then
+            warn "Batch install failed. Installing packages individually..."
+
+            for pkg in $CORE_PKGS; do
+                if ! $PIP install -q "$pkg" 2>/dev/null; then
+                    # opencv fallback: try different package names
+                    if echo "$pkg" | grep -qi "opencv"; then
+                        warn "opencv-python-headless failed, trying opencv-python..."
+                        $PIP install -q "opencv-python" 2>/dev/null || {
                             err "Failed to install OpenCV. Camera streaming will not work."
                         }
                     else
-                        warn "Failed to install: $pkg"
+                        warn "Failed to install: $pkg — retrying with no version constraint..."
+                        # Strip version specifier and retry
+                        base_pkg=$(echo "$pkg" | sed 's/[><=!].*//')
+                        $PIP install -q "$base_pkg" 2>/dev/null || {
+                            err "Cannot install $base_pkg"
+                        }
                     fi
                 fi
-            done < requirements.txt
+            done
+
+            for pkg in $OPT_PKGS; do
+                $PIP install -q "$pkg" 2>/dev/null || {
+                    warn "$pkg not available (optional — will use cv2 fallback)"
+                }
+            done
         fi
 
         # Verify critical imports
         if ! .venv/bin/python -c "import cv2" 2>/dev/null; then
             err "OpenCV (cv2) not importable. Camera will not work."
-            err "  Try: pip install opencv-python-headless"
+            err "  Try: .venv/bin/python -m pip install opencv-python-headless"
             exit 1
         fi
         if ! .venv/bin/python -c "import flask" 2>/dev/null; then
             err "Flask not importable. Server will not start."
-            err "  Try: pip install flask"
+            err "  Try: .venv/bin/python -m pip install flask"
             exit 1
         fi
 
         touch .venv/.installed
+        ok "All dependencies installed"
     fi
 
     ok "Python environment ready"
@@ -685,7 +735,9 @@ start_streamer() {
         fi
     fi
 
-    source .venv/bin/activate
+    if [ -f ".venv/bin/activate" ]; then
+        source .venv/bin/activate
+    fi
 
     log "Starting camera streamer on port $PORT..."
 
